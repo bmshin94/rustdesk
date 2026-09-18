@@ -2776,6 +2776,16 @@ pub async fn get_ipv6_socket() -> Option<(Arc<UdpSocket>, bytes::Bytes)> {
     match UdpSocket::bind(addr).await {
         Err(err) => {
             log::warn!("Failed to create UDP socket for IPv6: {err}");
+            // The address is gone - a temporary one rotated out, or the network changed - and a
+            // probe that finds nothing would leave it in the cache to be handed back again. Only
+            // this error says so; a bind that fails for want of a descriptor keeps its address.
+            // And only if it is still the address that failed: a probe may have replaced it.
+            if err.kind() == std::io::ErrorKind::AddrNotAvailable {
+                let mut cached = PUBLIC_IPV6_ADDR.lock().unwrap();
+                if cached.0 == Some(addr) {
+                    cached.0 = None;
+                }
+            }
         }
         Ok(socket) => {
             if let Ok(local_addr_v6) = socket.local_addr() {
@@ -3415,5 +3425,21 @@ mod tests {
         // `decode_id_pk` is the same blob minus the fingerprint, so the field is invisible to
         // non-WebRTC handshakes.
         assert_eq!(decode_id_pk(&signed, &pk).unwrap(), (id, their_pk));
+    }
+
+    // A cached address the socket can no longer bind is dropped, not handed back for the rest of
+    // its minute. The documentation address is nobody's, so the bind fails wherever this runs
+    // with the one error that drops it - unless the host binds anything (ip_nonlocal_bind) or
+    // has no IPv6 at all, where there is no such failure to test.
+    #[tokio::test]
+    async fn test_ipv6_socket_forgets_an_address_it_cannot_bind() {
+        let dead = "[2001:db8::1]:0".parse::<SocketAddr>().unwrap();
+        match UdpSocket::bind(dead).await {
+            Err(e) if e.kind() == std::io::ErrorKind::AddrNotAvailable => {}
+            _ => return,
+        }
+        *PUBLIC_IPV6_ADDR.lock().unwrap() = (Some(dead), None);
+        assert!(get_ipv6_socket().await.is_none());
+        assert_eq!(PUBLIC_IPV6_ADDR.lock().unwrap().0, None);
     }
 }
